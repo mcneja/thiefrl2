@@ -1,8 +1,10 @@
-use crate::cell_grid::*;
+use crate::cell_grid;
+use crate::cell_grid::{Cell, CellGrid, CellType, INVALID_REGION, Item, ItemKind, Map, Random, Rect};
 use crate::coord::Coord;
-use rand::prelude::*;
-use std::cmp::min;
-use std::cmp::max;
+use crate::guard;
+
+use rand::prelude::{Rng, SliceRandom};
+use std::cmp::{min, max};
 use std::mem::swap;
 use multiarray::Array2D;
 
@@ -1711,10 +1713,10 @@ fn generate_initial_guard_pos(random: &mut Random, map: &Map) -> Option<Coord> {
 
 fn place_guard(random: &mut Random, map: &mut Map, pos: Coord) {
 
-    let mut guard = Guard {
+    let mut guard = guard::Guard {
         pos: pos,
         dir: Coord(1, 0),
-        mode: GuardMode::Patrol,
+        mode: guard::GuardMode::Patrol,
         speaking: false,
         has_moved: false,
         heard_thief: false,
@@ -1762,8 +1764,8 @@ fn cache_cell_info(map: &mut Map) {
         for y in 0..sy {
             let cell = &mut map.cells[[x, y]];
             let cell_type = cell.cell_type;
-            let tile = tile_def(cell_type);
-            cell.move_cost = guard_move_cost_for_tile_type(cell_type);
+            let tile = cell_grid::tile_def(cell_type);
+            cell.move_cost = cell_grid::guard_move_cost_for_tile_type(cell_type);
             cell.blocks_player_sight = tile.blocks_player_sight;
             cell.blocks_sight = tile.blocks_sight;
             cell.blocks_sound = tile.blocks_sound;
@@ -1774,7 +1776,7 @@ fn cache_cell_info(map: &mut Map) {
     for item in &map.items {
         let cell = &mut map.cells[[item.pos.0 as usize, item.pos.1 as usize]];
         let kind = item.kind;
-        cell.move_cost = max(cell.move_cost, guard_move_cost_for_item_kind(kind));
+        cell.move_cost = max(cell.move_cost, cell_grid::guard_move_cost_for_item_kind(kind));
         if kind == ItemKind::DoorNS || kind == ItemKind::DoorEW {
             cell.blocks_player_sight = true;
         }

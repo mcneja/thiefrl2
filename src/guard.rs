@@ -1,27 +1,49 @@
-use crate::cell_grid::*;
+use crate::cell_grid::{CellType, INFINITE_COST, INVALID_REGION, Map, Player, Random};
 use crate::coord::Coord;
-use rand::prelude::*;
-use std::cmp::min;
-use std::cmp::max;
-use multiarray::Array2D;
-
 use crate::speech_bubbles::Popups;
+
+use multiarray::Array2D;
+use rand::Rng;
+use std::cmp::{min, max};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GuardMode
+{
+    Patrol,
+    Look,
+    Listen,
+    ChaseVisibleTarget,
+    MoveToLastSighting,
+    MoveToLastSound,
+    MoveToGuardShout,
+}
+
+pub struct Guard {
+    pub pos: Coord,
+    pub dir: Coord,
+    pub mode: GuardMode,
+    pub speaking: bool,
+    pub has_moved: bool,
+    pub heard_thief: bool,
+    pub hearing_guard: bool,
+    pub heard_guard: bool,
+    pub heard_guard_pos: Coord,
+
+    // Chase
+    pub goal: Coord,
+    pub mode_timeout: usize,
+
+    // Patrol
+    pub region_goal: usize,
+    pub region_prev: usize,
+}
 
 struct Shout {
     pos_shouter: Coord, // where is the person shouting?
     pos_target: Coord, // where are they reporting the player is?
 }
 
-pub fn is_guard_at(map: &Map, x: i32, y: i32) -> bool {
-    for guard in &map.guards {
-        if guard.pos.0 == x && guard.pos.1 == y {
-            return true;
-        }
-    }
-    return false;
-}
-
-pub fn guard_act_all(random: &mut Random, popups: &mut Popups, lines: &mut Lines, map: &mut Map, player: &mut Player) {
+pub fn guard_act_all(random: &mut Random, see_all: bool, popups: &mut Popups, lines: &mut Lines, map: &mut Map, player: &mut Player) {
 
     // Mark if we heard a guard last turn, and clear the speaking flag.
 
@@ -35,7 +57,7 @@ pub fn guard_act_all(random: &mut Random, popups: &mut Popups, lines: &mut Lines
     let mut shouts: Vec<Shout> = Vec::new();
 
     for mut guard in guards.drain(..) {
-        guard.act(random, popups, lines, player, map, &mut shouts);
+        guard.act(random, see_all, popups, lines, player, map, &mut shouts);
         map.guards.push(guard);
     }
 
@@ -47,7 +69,7 @@ pub fn guard_act_all(random: &mut Random, popups: &mut Popups, lines: &mut Lines
 }
 
 fn alert_nearby_guards(map: &mut Map, shout: &Shout) {
-    for guard in map.find_guards_in_earshot(shout.pos_shouter, 150) {
+    for guard in map.guards_in_earshot(shout.pos_shouter, 150) {
         if guard.pos != shout.pos_shouter {
             guard.hear_guard(shout.pos_target);
         }
@@ -77,7 +99,7 @@ fn pos_next_best(map: &Map, distance_field: &Array2D<usize>, pos_from: Coord) ->
                 continue;
             }
 
-            if map.pos_blocked_by_guard(pos) {
+            if map.is_guard_at(pos) {
                 continue;
             }
 
@@ -136,6 +158,32 @@ pub fn new_lines() -> Lines {
     }
 }
 
+fn lines_for_state_change(lines: &mut Lines, mode_prev: GuardMode, mode_next: GuardMode) -> Option<&mut LineIter> {
+    if mode_next == mode_prev {
+        None
+    } else {
+        match mode_next {
+            GuardMode::Patrol => {
+                match mode_prev {
+                    GuardMode::Look => Some(&mut lines.done_looking),
+                    GuardMode::Listen => Some(&mut lines.done_listening),
+                    GuardMode::MoveToLastSound |
+                    GuardMode::MoveToGuardShout => Some(&mut lines.end_investigate),
+                    GuardMode::MoveToLastSighting => Some(&mut lines.end_chase),
+                    _ => None
+                }
+            },
+            GuardMode::Look => Some(&mut lines.see),
+            GuardMode::Listen => Some(&mut lines.hear),
+            GuardMode::ChaseVisibleTarget =>
+                if mode_prev != GuardMode::MoveToLastSighting {Some(&mut lines.chase)} else {None},
+            GuardMode::MoveToLastSighting => None,
+            GuardMode::MoveToLastSound => Some(&mut lines.investigate),
+            GuardMode::MoveToGuardShout => Some(&mut lines.hear_guard),
+        }
+    }
+}
+
 impl Guard {
 
 fn pre_turn(&mut self) {
@@ -154,7 +202,7 @@ fn hear_guard(&mut self, pos_target: Coord) {
     self.heard_guard_pos = pos_target;
 }
 
-fn act(&mut self, random: &mut Random, popups: &mut Popups, lines: &mut Lines, player: &mut Player, map: &Map, shouts: &mut Vec<Shout>) {
+fn act(&mut self, random: &mut Random, see_all: bool, popups: &mut Popups, lines: &mut Lines, player: &mut Player, map: &Map, shouts: &mut Vec<Shout>) {
 
     let mode_prev = self.mode;
     let pos_prev = self.pos;
@@ -267,53 +315,23 @@ fn act(&mut self, random: &mut Random, popups: &mut Popups, lines: &mut Lines, p
 
     // Say something to indicate state changes
 
-    if mode_prev != self.mode {
-        match self.mode {
-            GuardMode::Patrol => {
-                if mode_prev == GuardMode::Look {
-                    self.say(popups, player, lines.done_looking.next());
-                } else if mode_prev == GuardMode::Listen {
-                    self.say(popups, player, lines.done_listening.next());
-                }
-                else if mode_prev == GuardMode::MoveToLastSound || mode_prev == GuardMode::MoveToGuardShout {
-                    self.say(popups, player, lines.end_investigate.next());
-                }
-                else if mode_prev == GuardMode::MoveToLastSighting {
-                    self.say(popups, player, lines.end_chase.next());
-                }
-            },
-            GuardMode::Look => {
-                self.say(popups, player, lines.see.next());
-            },
-            GuardMode::Listen => {
-                self.say(popups, player, lines.hear.next());
-            },
-            GuardMode::ChaseVisibleTarget => {
-                if mode_prev != GuardMode::MoveToLastSighting {
-                    shouts.push(Shout{pos_shouter: self.pos, pos_target: player.pos});
-                    self.say(popups, player, lines.chase.next());
-                }
-            },
-            GuardMode::MoveToLastSighting => {
-            },
-            GuardMode::MoveToLastSound => {
-                self.say(popups, player, lines.investigate.next());
-            },
-            GuardMode::MoveToGuardShout => {
-                self.say(popups, player, lines.hear_guard.next());
-            },
-        }
+    if let Some(line_iter) = lines_for_state_change(lines, mode_prev, self.mode) {
+        self.say(popups, player, see_all, line_iter.next());
+    }
+
+    if self.mode == GuardMode::ChaseVisibleTarget && mode_prev != GuardMode::ChaseVisibleTarget {
+        shouts.push(Shout{pos_shouter: self.pos, pos_target: player.pos});
     }
 }
 
-pub fn overhead_icon(&self, map: &Map, player: &Player) -> Option<u32> {
+pub fn overhead_icon(&self, map: &Map, player: &Player, see_all: bool) -> Option<u32> {
     if self.mode == GuardMode::Patrol {
         return None;
     }
 
     let cell = &map.cells[[self.pos.0 as usize, self.pos.1 as usize]];
 
-    let visible = player.see_all || cell.seen || self.speaking;
+    let visible = see_all || cell.seen || self.speaking;
     if !visible {
         let dpos = player.pos - self.pos;
         if dpos.length_squared() > 25 {
@@ -324,11 +342,11 @@ pub fn overhead_icon(&self, map: &Map, player: &Player) -> Option<u32> {
     Some(if self.mode == GuardMode::ChaseVisibleTarget {216} else {215})
 }
 
-fn say(&mut self, popups: &mut Popups, player: &Player, msg: &'static str) {
+fn say(&mut self, popups: &mut Popups, player: &Player, see_all: bool, msg: &'static str) {
     let d = self.pos - player.pos;
     let dist_squared = d.length_squared();
 
-    if dist_squared < 200 || player.see_all {
+    if dist_squared < 200 || see_all {
         popups.guard_speech(self.pos, msg);
     }
 
@@ -459,13 +477,13 @@ pub fn setup_goal_region(&mut self, random: &mut Random, map: &Map) {
 
 }
 
-fn update_dir(dir_forward: Coord, dir_aim: Coord) -> Coord {
+pub fn update_dir(dir_forward: Coord, dir_aim: Coord) -> Coord {
     let dir_left = Coord(-dir_forward.1, dir_forward.0);
 
     let dot_forward = dir_forward.dot(dir_aim);
     let dot_left = dir_left.dot(dir_aim);
 
-    if dot_forward.abs() > dot_left.abs() {
+    if dot_forward.abs() >= dot_left.abs() {
         if dot_forward >= 0 {dir_forward} else {-dir_forward}
     } else if dot_left.abs() > dot_forward.abs() {
         if dot_left >= 0 {dir_left} else {-dir_left}

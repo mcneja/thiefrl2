@@ -1,19 +1,22 @@
-use rand::{SeedableRng};
+use rand::SeedableRng;
 use std::cmp::{min, max};
 
+use crate::cell_grid::{CellGrid, CellType, ItemKind, Map, Player, Random, make_player, tile_def};
 use crate::color_preset;
 use crate::coord::Coord;
-use crate::fontdata;
 use crate::engine;
-use crate::speech_bubbles::{get_horizontal_extents, puts_proportional, new_popups, Popups};
-use crate::cell_grid::{CellGrid, CellType, GuardMode, ItemKind, Map, Player, Random, make_player, tile_def};
-use crate::guard::{Lines, guard_act_all, is_guard_at, new_lines};
+use crate::fontdata;
+use crate::guard::{GuardMode, Lines, guard_act_all, new_lines, update_dir};
 use crate::random_map;
+use crate::speech_bubbles::{get_horizontal_extents, puts_proportional, new_popups, Popups};
 
 const BAR_HEIGHT: i32 = fontdata::LINE_HEIGHT + 2;
 const BAR_BACKGROUND_COLOR: u32 = 0xff101010;
 
 const TILE_SIZE: i32 = 16;
+
+const INITIAL_LEVEL: usize = 0;
+const SEE_ALL_DEFAULT: bool = false;
 
 pub struct Game {
     random: Random,
@@ -22,6 +25,8 @@ pub struct Game {
     lines: Lines,
     popups: Popups,
     player: Player,
+    finished_level: bool,
+    see_all: bool,
     show_msgs: bool,
     show_help: bool,
     help_page: usize,
@@ -29,7 +34,7 @@ pub struct Game {
 
 pub fn new_game(seed: u64) -> Game {
     let mut random = Random::seed_from_u64(seed);
-    let level = 0;
+    let level = INITIAL_LEVEL;
     let mut map = random_map::generate_map(&mut random, level);
     let player = make_player(map.pos_start);
     let lines = new_lines();
@@ -44,6 +49,8 @@ pub fn new_game(seed: u64) -> Game {
         popups,
         map,
         player,
+        finished_level: false,
+        see_all: SEE_ALL_DEFAULT,
         show_msgs: true,
         show_help: false,
         help_page: 0,
@@ -51,14 +58,13 @@ pub fn new_game(seed: u64) -> Game {
 }
 
 fn restart_game(game: &mut Game) {
-    let see_all = game.player.see_all;
-    game.level = 0;
+    game.level = INITIAL_LEVEL;
     game.map = random_map::generate_map(&mut game.random, game.level);
+    game.finished_level = false;
     game.player = make_player(game.map.pos_start);
     game.show_msgs = true;
     game.show_help = false;
     game.popups = new_popups();
-    game.player.see_all = see_all;
 
     update_map_visibility(&mut game.map, game.player.pos);
 }
@@ -72,9 +78,11 @@ pub fn on_draw(game: &Game, screen_size_x: i32, screen_size_y: i32) {
     let map_size_x = map.cells.extents()[0];
     let map_size_y = map.cells.extents()[1];
 
+    let view_min = Coord(0, BAR_HEIGHT);
+    let view_max = Coord(screen_size_x, screen_size_y - BAR_HEIGHT);
     let view_offset = viewport_offset(
-        Coord(0, BAR_HEIGHT),
-        Coord(screen_size_x, screen_size_y - BAR_HEIGHT),
+        view_min,
+        view_max,
         Coord(map_size_x as i32, map_size_y as i32),
         player.pos);
 
@@ -90,57 +98,59 @@ pub fn on_draw(game: &Game, screen_size_x: i32, screen_size_y: i32) {
         draw_tile_by_index(tile_index, dest_x, dest_y, color);
     };
 
+    // Base map
+
+    const UNLIT_COLOR: u32 = color_preset::DARK_BLUE;
+
     for x in 0..map_size_x {
         for y in 0..map_size_y {
             let cell = &map.cells[[x, y]];
-            if !cell.seen && !player.see_all {
+            if !cell.seen && !game.see_all {
                 continue;
             }
             let tile = tile_def(cell.cell_type);
-            let color = if cell.lit || tile.ignores_lighting {tile.color} else {color_preset::DARK_BLUE};
+            let color = if cell.lit || tile.ignores_lighting {tile.color} else {UNLIT_COLOR};
             put_tile(tile.glyph, x as i32, y as i32, color);
         }
     }
 
+    // Items
+
     for item in items {
         let cell = &map.cells[[item.pos.0 as usize, item.pos.1 as usize]];
-        if !cell.seen && !player.see_all {
+        if !cell.seen && !game.see_all {
             continue;
         }
         let glyph = glyph_for_item(item.kind);
-        let color = if cell.lit {color_for_item(item.kind)} else {color_preset::DARK_BLUE};
+        let color = if cell.lit {color_for_item(item.kind)} else {UNLIT_COLOR};
         put_tile(glyph, item.pos.0, item.pos.1, color);
     }
 
+    // Player
+
     {
-        let glyph = 208;
+        let tile_index = 208;
 
         let lit = map.cells[[player.pos.0 as usize, player.pos.1 as usize]].lit;
-        let noisy = player.noisy;
-        let damaged = player.damaged_last_turn;
         let hidden = player.hidden(map);
 
         let color =
-            if damaged {0xff0000ff}
-            else if noisy {color_preset::LIGHT_CYAN}
+            if player.damaged_last_turn {0xff0000ff}
+            else if player.noisy {color_preset::LIGHT_CYAN}
             else if hidden {0xd0101010}
-            else if lit {color_preset::LIGHT_GRAY}
-            else {color_preset::LIGHT_BLUE};
+            else if !lit {color_preset::LIGHT_BLUE}
+            else {color_preset::LIGHT_GRAY};
 
-        put_tile(glyph, player.pos.0, player.pos.1, color);
+        put_tile(tile_index, player.pos.0, player.pos.1, color);
     }
 
-    for guard in guards {
-        let glyph =
-            if guard.dir.1 > 0 {210}
-            else if guard.dir.1 < 0 {212}
-            else if guard.dir.0 > 0 {209}
-            else if guard.dir.0 < 0 {211}
-            else {212};
+    // Guards
 
+    for guard in guards {
+        let tile_index = 209 + tile_index_offset_for_dir(guard.dir);
         let cell = &map.cells[[guard.pos.0 as usize, guard.pos.1 as usize]];
         
-        let visible = player.see_all || cell.seen || guard.speaking;
+        let visible = game.see_all || cell.seen || guard.speaking;
 
         if !visible {
             let dpos = player.pos - guard.pos;
@@ -153,17 +163,19 @@ pub fn on_draw(game: &Game, screen_size_x: i32, screen_size_y: i32) {
             if !visible {
                 color_preset::DARK_GRAY
             } else if guard.mode == GuardMode::Patrol && !guard.speaking && !cell.lit {
-                color_preset::DARK_BLUE
+                UNLIT_COLOR
             } else {
                 color_preset::LIGHT_MAGENTA
             };
 
-        put_tile(glyph, guard.pos.0, guard.pos.1, color);
+        put_tile(tile_index, guard.pos.0, guard.pos.1, color);
     }
 
+    // Guard overhead icons
+
     for guard in guards {
-        if let Some(glyph) = guard.overhead_icon(map, player) {
-            put_offset_tile(glyph, guard.pos.0, guard.pos.1, color_preset::LIGHT_YELLOW, 0, 10);
+        if let Some(tile_index) = guard.overhead_icon(map, player, game.see_all) {
+            put_offset_tile(tile_index, guard.pos.0, guard.pos.1, color_preset::LIGHT_YELLOW, 0, 10);
         }
     }
 
@@ -246,6 +258,14 @@ pub fn on_draw(game: &Game, screen_size_x: i32, screen_size_y: i32) {
     draw_bottom_status_bar(screen_size_x, screen_size_y, game);
 }
 
+fn tile_index_offset_for_dir(dir: Coord) -> u32 {
+    if dir.1 > 0 {1}
+    else if dir.1 < 0 {3}
+    else if dir.0 > 0 {0}
+    else if dir.0 < 0 {2}
+    else {3}
+}
+
 fn viewport_offset(viewport_screen_min: Coord, viewport_screen_max: Coord, world_size: Coord, world_focus: Coord) -> Coord {
     let viewport_screen_size = viewport_screen_max - viewport_screen_min;
     let world_screen_size = Coord(TILE_SIZE, TILE_SIZE).mul_components(world_size);
@@ -294,7 +314,24 @@ fn color_for_item(kind: ItemKind) -> u32 {
     }
 }
 
-fn move_player(game: &mut Game, mut dx: i32, mut dy: i32) {
+fn advance_to_next_level(game: &mut Game) {
+    game.level += 1;
+    game.map = random_map::generate_map(&mut game.random, game.level);
+    game.finished_level = false;
+
+    game.player.pos = game.map.pos_start;
+    game.player.dir = Coord(0, -1);
+    game.player.gold = 0;
+    game.player.noisy = false;
+    game.player.damaged_last_turn = false;
+    game.player.turns_remaining_underwater = 0;
+
+    update_map_visibility(&mut game.map, game.player.pos);
+
+    engine::invalidate_screen();
+}
+
+fn move_player(game: &mut Game, mut dpos: Coord) {
     let player = &mut game.player;
 
     // Can't move if you're dead.
@@ -305,59 +342,39 @@ fn move_player(game: &mut Game, mut dx: i32, mut dy: i32) {
 
     // Are we trying to exit the level?
 
-    let pos_new = player.pos + Coord(dx, dy);
+    let pos_new = player.pos + dpos;
 
     if !on_level(&game.map.cells, pos_new) && game.map.all_seen() && game.map.all_loot_collected() {
-        game.level += 1;
-        game.map = random_map::generate_map(&mut game.random, game.level);
-
-        game.player.pos = game.map.pos_start;
-        game.player.dir = Coord(0, 0);
-        game.player.gold = 0;
-        game.player.noisy = false;
-        game.player.damaged_last_turn = false;
-        game.player.finished_level = false;
-        game.player.turns_remaining_underwater = 0;
-
-        update_map_visibility(&mut game.map, game.player.pos);
-
-        engine::invalidate_screen();
+        advance_to_next_level(game);
         return;
     }
 
-    if dx == 0 || dy == 0 {
-        if blocked(&game.map, player.pos, pos_new) {
-            return;
-        }
-    } else if blocked(&game.map, player.pos, pos_new) {
-        if halts_slide(&game.map, pos_new) {
+    if blocked(&game.map, player.pos, pos_new) {
+        if dpos.0 == 0 || dpos.1 == 0 || halts_slide(&game.map, pos_new) {
             return;
         } else {
             // Attempting to move diagonally; may be able to slide along a wall.
 
-            let v_blocked = blocked(&game.map, player.pos, player.pos + Coord(dx, 0));
-            let h_blocked = blocked(&game.map, player.pos, player.pos + Coord(0, dy));
+            let v_blocked = blocked(&game.map, player.pos, player.pos + Coord(dpos.0, 0));
+            let h_blocked = blocked(&game.map, player.pos, player.pos + Coord(0, dpos.1));
 
             if v_blocked {
                 if h_blocked {
                     return;
                 }
-
-                dx = 0;
+                dpos.0 = 0;
             } else {
                 if !h_blocked {
                     return;
                 }
-
-                dy = 0;
+                dpos.1 = 0;
             }
         }
     }
 
     pre_turn(game);
 
-    let dpos = Coord(dx, dy);
-    game.player.dir = dpos;
+    game.player.dir = update_dir(game.player.dir, dpos);
     game.player.pos += dpos;
     game.player.gold += game.map.collect_loot_at(game.player.pos);
 
@@ -378,19 +395,17 @@ fn make_noise(map: &mut Map, player: &mut Player, popups: &mut Popups, noise: &'
     player.noisy = true;
     popups.noise(player.pos, noise);
 
-    let guards = map.find_guards_in_earshot(player.pos, 75);
-
-    for guard in guards {
+    for guard in map.guards_in_earshot(player.pos, 75) {
         guard.hear_thief();
     }
 }
 
 fn halts_slide(map: &Map, pos: Coord) -> bool {
-    if pos.0 < 0 || pos.0 >= map.cells.extents()[0] as i32 || pos.1 < 0 || pos.1 >= map.cells.extents()[1] as i32 {
+    if !on_level(&map.cells, pos) {
         return false;
     }
 
-    if is_guard_at(map, pos.0, pos.1) {
+    if map.is_guard_at(pos) {
         return true;
     }
 
@@ -402,7 +417,6 @@ fn pre_turn(game: &mut Game) {
     game.popups.clear();
     game.player.noisy = false;
     game.player.damaged_last_turn = false;
-    game.player.dir = Coord(0, 0);
 }
 
 const DIRS: [Coord; 4] = [
@@ -421,12 +435,12 @@ fn advance_time(game: &mut Game) {
         game.player.turns_remaining_underwater = 7;
     }
 
-    guard_act_all(&mut game.random, &mut game.popups, &mut game.lines, &mut game.map, &mut game.player);
+    guard_act_all(&mut game.random, game.see_all, &mut game.popups, &mut game.lines, &mut game.map, &mut game.player);
 
     update_map_visibility(&mut game.map, game.player.pos);
 
     if game.map.all_seen() && game.map.all_loot_collected() {
-        game.player.finished_level = true;
+        game.finished_level = true;
     }
 }
 
@@ -435,7 +449,7 @@ fn update_map_visibility(map: &mut Map, pos_viewer: Coord) {
 
     for dir in &DIRS {
         let pos = pos_viewer + *dir;
-        if !blocked(map, pos_viewer, pos) {
+        if map.player_can_see_in_direction(pos_viewer, *dir) {
             map.recompute_visibility(pos);
         }
     }
@@ -450,6 +464,10 @@ fn on_level(map: &CellGrid, pos: Coord) -> bool {
 fn blocked(map: &Map, pos_old: Coord, pos_new: Coord) -> bool {
     if !on_level(&map.cells, pos_new) {
         return true;
+    }
+
+    if pos_old == pos_new {
+        return false;
     }
 
     let tile_type = map.cells[[pos_new.0 as usize, pos_new.1 as usize]].cell_type;
@@ -475,7 +493,7 @@ fn blocked(map: &Map, pos_old: Coord, pos_new: Coord) -> bool {
         return true;
     }
 
-    if is_guard_at(map, pos_new.0, pos_new.1) {
+    if map.is_guard_at(pos_new) {
         return true;
     }
 
@@ -500,16 +518,23 @@ fn on_key_down_game_mode(game: &mut Game, key: i32, ctrl_key_down: bool, shift_k
         game.show_msgs = !game.show_msgs;
         engine::invalidate_screen();
     } else if let Some(dir) = dir_from_key(key, ctrl_key_down, shift_key_down) {
-        move_player(game, dir.0, dir.1);
+        move_player(game, dir);
     } else if ctrl_key_down {
         match key {
             engine::KEY_A => {
-                game.player.see_all = !game.player.see_all;
+                game.see_all = !game.see_all;
                 engine::invalidate_screen();
             },
             engine::KEY_C => {
                 game.map.mark_all_unseen();
                 update_map_visibility(&mut game.map, game.player.pos);
+                engine::invalidate_screen();
+            },
+            engine::KEY_L => {
+                game.player.gold += game.map.collect_all_loot();
+                if game.map.all_seen() {
+                    game.finished_level = true;
+                }
                 engine::invalidate_screen();
             },
             engine::KEY_R => {
@@ -518,6 +543,9 @@ fn on_key_down_game_mode(game: &mut Game, key: i32, ctrl_key_down: bool, shift_k
             },
             engine::KEY_S => {
                 game.map.mark_all_seen();
+                if game.map.all_loot_collected() {
+                    game.finished_level = true;
+                }
                 engine::invalidate_screen();
             },
             _ => {}
@@ -526,23 +554,32 @@ fn on_key_down_game_mode(game: &mut Game, key: i32, ctrl_key_down: bool, shift_k
 }
 
 fn dir_from_key(key: i32, ctrl_key_down: bool, shift_key_down: bool) -> Option<Coord> {
-    let vertical_offset =
-        if ctrl_key_down {-1} else {0} +
-        if shift_key_down {1} else {0};
-
-    match key {
-        engine::KEY_LEFT => Some(Coord(-1, vertical_offset)),
-        engine::KEY_UP | engine::KEY_NUMPAD8 | engine::KEY_K => Some(Coord(0, 1)),
-        engine::KEY_RIGHT => Some(Coord(1, vertical_offset)),
-        engine::KEY_DOWN | engine::KEY_NUMPAD2 | engine::KEY_J => Some(Coord(0, -1)),
-        engine::KEY_NUMPAD1 | engine::KEY_B => Some(Coord(-1, -1)),
-        engine::KEY_NUMPAD4 | engine::KEY_H => Some(Coord(-1, 0)),
-        engine::KEY_NUMPAD6 | engine::KEY_L => Some(Coord(1, 0)),
-        engine::KEY_NUMPAD3 | engine::KEY_N => Some(Coord(1, -1)),
-        engine::KEY_NUMPAD9 | engine::KEY_U => Some(Coord(1, 1)),
-        engine::KEY_NUMPAD7 | engine::KEY_Y => Some(Coord(-1, 1)),
-        engine::KEY_NUMPAD5 | engine::KEY_PERIOD => Some(Coord(0, 0)),
-        _ => None
+    if ctrl_key_down || shift_key_down {
+        let vertical_offset =
+            if ctrl_key_down {-1} else {0} +
+            if shift_key_down {1} else {0};
+        match key {
+            engine::KEY_LEFT => Some(Coord(-1, vertical_offset)),
+            engine::KEY_UP => Some(Coord(0, 1)),
+            engine::KEY_RIGHT => Some(Coord(1, vertical_offset)),
+            engine::KEY_DOWN => Some(Coord(0, -1)),
+            _ => None
+        }
+    } else {
+        match key {
+            engine::KEY_LEFT => Some(Coord(-1, 0)),
+            engine::KEY_UP | engine::KEY_NUMPAD8 | engine::KEY_K => Some(Coord(0, 1)),
+            engine::KEY_RIGHT => Some(Coord(1, 0)),
+            engine::KEY_DOWN | engine::KEY_NUMPAD2 | engine::KEY_J => Some(Coord(0, -1)),
+            engine::KEY_NUMPAD1 | engine::KEY_B => Some(Coord(-1, -1)),
+            engine::KEY_NUMPAD4 | engine::KEY_H => Some(Coord(-1, 0)),
+            engine::KEY_NUMPAD6 | engine::KEY_L => Some(Coord(1, 0)),
+            engine::KEY_NUMPAD3 | engine::KEY_N => Some(Coord(1, -1)),
+            engine::KEY_NUMPAD9 | engine::KEY_U => Some(Coord(1, 1)),
+            engine::KEY_NUMPAD7 | engine::KEY_Y => Some(Coord(-1, 1)),
+            engine::KEY_NUMPAD5 | engine::KEY_PERIOD => Some(Coord(0, 0)),
+            _ => None
+        }
     }
 }
 
@@ -671,7 +708,7 @@ fn draw_top_status_bar(screen_size_x: i32, screen_size_y: i32, game: &Game) {
         let msg =
             if game.player.health == 0 {
                 format!("You are dead! Press Ctrl+R for a new game.")
-            } else if game.player.finished_level {
+            } else if game.finished_level {
                 format!("Level {} complete! Move off the edge of the map to advance to the next level.", game.level + 1)
             } else if game.level == 0 {
                 format!("Welcome to level {}. Collect the gold coins and reveal the whole mansion. (Press ? for help.)", game.level + 1)

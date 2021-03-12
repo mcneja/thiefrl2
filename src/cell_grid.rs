@@ -1,10 +1,12 @@
 use crate::color_preset;
 use crate::coord::Coord;
+use crate::guard;
 use multiarray::Array2D;
 use rand::Rng;
 use std::cmp::min;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 pub type Random = rand_pcg::Pcg32;
@@ -74,41 +76,9 @@ pub struct Map {
     pub patrol_regions: Vec<Rect>,
     pub patrol_routes: Vec<(usize, usize)>,
     pub items: Vec<Item>,
-    pub guards: Vec<Guard>,
+    pub guards: Vec<guard::Guard>,
     pub pos_start: Coord,
     pub total_loot: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum GuardMode
-{
-    Patrol,
-    Look,
-    Listen,
-    ChaseVisibleTarget,
-    MoveToLastSighting,
-    MoveToLastSound,
-    MoveToGuardShout,
-}
-
-pub struct Guard {
-    pub pos: Coord,
-    pub dir: Coord,
-    pub mode: GuardMode,
-    pub speaking: bool,
-    pub has_moved: bool,
-    pub heard_thief: bool,
-    pub hearing_guard: bool,
-    pub heard_guard: bool,
-    pub heard_guard_pos: Coord,
-
-    // Chase
-    pub goal: Coord,
-    pub mode_timeout: usize,
-
-    // Patrol
-    pub region_goal: usize,
-    pub region_prev: usize,
 }
 
 pub struct Item {
@@ -137,11 +107,8 @@ pub struct Player {
 
     pub noisy: bool, // did the player make noise last turn?
     pub damaged_last_turn: bool,
-    pub finished_level: bool,
 
     pub turns_remaining_underwater: usize,
-
-    pub see_all: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,15 +213,13 @@ pub fn make_player(pos: Coord) -> Player {
     let health = 5;
     Player {
         pos: pos,
-        dir: Coord(0, 0),
+        dir: Coord(0, -1),
         max_health: health,
         health: health,
         gold: 0,
         noisy: false,
         damaged_last_turn: false,
-        finished_level: false,
         turns_remaining_underwater: 0,
-        see_all: false,
     }
 }
 
@@ -265,10 +230,8 @@ impl Player {
     }
 
     pub fn hidden(&self, map: &Map) -> bool {
-        for guard in &map.guards {
-            if guard.mode == GuardMode::ChaseVisibleTarget {
-                return false;
-            }
+        if map.guards.iter().any(|guard| guard.mode == guard::GuardMode::ChaseVisibleTarget) {
+            return false;
         }
 
         if map.hides_player(self.pos.0, self.pos.1) {
@@ -345,6 +308,12 @@ pub fn collect_loot_at(&mut self, pos: Coord) -> usize {
     gold
 }
 
+pub fn collect_all_loot(&mut self) -> usize {
+    let mut gold = 0;
+    self.items.retain(|item| if item.kind == ItemKind::Coin {gold += 1; false} else {true});
+    gold
+}
+
 pub fn all_seen(&self) -> bool {
     // There's got to be a better way to iterate over all the cells...
     for x in 0..self.cells.extents()[0] {
@@ -397,6 +366,21 @@ pub fn recompute_visibility(&mut self, pos_viewer: Coord) {
             portal.rx, portal.ry
         );
     }
+}
+
+pub fn player_can_see_in_direction(&self, pos_viewer: Coord, dir: Coord) -> bool {
+    let pos_target = pos_viewer + dir;
+    if pos_target.0 < 0 ||
+       pos_target.1 < 0 ||
+       pos_target.0 as usize >= self.cells.extents()[0] ||
+       pos_target.1 as usize >= self.cells.extents()[1] {
+        return true;
+    }
+
+    if !allowed_direction(self.cells[[pos_target.0 as usize, pos_target.1 as usize]].cell_type, dir.0, dir.1) {
+        return false;
+    }
+    !self.blocks_player_sight(pos_target.0, pos_target.1)
 }
 
 fn compute_visibility(
@@ -490,12 +474,11 @@ fn compute_visibility(
 }
 
 pub fn all_loot_collected(&self) -> bool {
-    for item in &self.items {
-        if item.kind == ItemKind::Coin {
-            return false;
-        }
-    }
-    true
+    !self.items.iter().any(|item| item.kind == ItemKind::Coin)
+}
+
+pub fn is_guard_at(&self, pos: Coord) -> bool {
+    self.guards.iter().any(|guard| guard.pos == pos)
 }
 
 pub fn random_neighbor_region(&self, random: &mut Random, region: usize, region_exclude: usize) -> usize {
@@ -537,16 +520,6 @@ pub fn guard_move_cost(&self, pos_old: Coord, pos_new: Coord) -> usize {
     }
 
     cost
-}
-
-pub fn pos_blocked_by_guard(&self, pos: Coord) -> bool {
-    for guard in &self.guards {
-        if guard.pos == pos {
-            return true;
-        }
-    }
-
-    false
 }
 
 pub fn closest_region(&self, pos: Coord) -> usize {
@@ -712,29 +685,32 @@ pub fn hides_player(&self, x: i32, y: i32) -> bool {
     self.cells[[x as usize, y as usize]].hides_player
 }
 
-pub fn find_guards_in_earshot(&mut self, emitter_pos: Coord, radius: i32) -> Vec<&mut Guard> {
-    let mut visited: Array2D<bool> = Array2D::new([self.cells.extents()[0], self.cells.extents()[1]], false);
-
+pub fn coords_in_earshot(&self, emitter_pos: Coord, radius: i32) -> HashSet<Coord> {
     // Flood-fill from the emitter position.
 
-    let mut points: VecDeque<Coord> = VecDeque::new();
-    points.push_back(emitter_pos);
-    visited[[emitter_pos.0 as usize, emitter_pos.1 as usize]] = true;
+    let capacity = self.cells.extents()[0] * self.cells.extents()[1];
+    let mut coords_visited: HashSet<Coord> = HashSet::with_capacity(capacity);
+    let mut coords_to_visit: VecDeque<Coord> = VecDeque::with_capacity(capacity);
 
-    while let Some(pos) = points.pop_front() {
+    coords_to_visit.push_back(emitter_pos);
+
+    while let Some(pos) = coords_to_visit.pop_front() {
+
+        coords_visited.insert(pos);
+
         for dir in &SOUND_NEIGHBORS {
             let new_pos = pos + *dir;
 
             // Skip positions that are off the map.
 
             if new_pos.0 < 0 || new_pos.0 >= self.cells.extents()[0] as i32 ||
-                new_pos.1 < 0 || new_pos.1 >= self.cells.extents()[1] as i32 {
+               new_pos.1 < 0 || new_pos.1 >= self.cells.extents()[1] as i32 {
                 continue;
             }
 
             // Skip neighbors that have already been visited.
 
-            if visited[[new_pos.0 as usize, new_pos.1 as usize]] {
+            if coords_visited.contains(&new_pos) {
                 continue;
             }
 
@@ -752,22 +728,16 @@ pub fn find_guards_in_earshot(&mut self, emitter_pos: Coord, radius: i32) -> Vec
                 continue;
             }
 
-            visited[[new_pos.0 as usize, new_pos.1 as usize]] = true;
-            points.push_back(new_pos);
+            coords_to_visit.push_back(new_pos);
         }
     }
 
-    // Return guards that are on marked squares.
+    coords_visited
+}
 
-    let mut guards = Vec::with_capacity(self.guards.len());
-
-    for guard in &mut self.guards {
-        if visited[[guard.pos.0 as usize, guard.pos.1 as usize]] {
-            guards.push(guard);
-        }
-    }
-
-    guards
+pub fn guards_in_earshot(&mut self, emitter_pos: Coord, radius: i32) -> Vec<&mut guard::Guard> {
+    let coords_in_earshot = self.coords_in_earshot(emitter_pos, radius);
+    self.guards.iter_mut().filter(|guard| coords_in_earshot.contains(&guard.pos)).collect()
 }
 
 }
